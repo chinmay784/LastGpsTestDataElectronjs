@@ -28,7 +28,6 @@
 const { app, BrowserWindow, ipcMain } = require("electron");
 const path = require("path");
 const usbDetect = require("usb-detection");
-const drivelist = require("drivelist");
 const { SerialPort } = require("serialport");
 const { ReadlineParser } = require("@serialport/parser-readline");
 
@@ -47,87 +46,58 @@ function createMainWindow() {
   });
 
   mainWindow.webContents.openDevTools();
-  mainWindow.loadURL("http://localhost:5173"); // Vite dev server
-  // Or production:
-  // mainWindow.loadFile(path.join(__dirname, "./dist/index.html"));
+  mainWindow.loadURL("http://localhost:5173");
 
-  // Handle USB drive list
-  ipcMain.handle("list-usb-drives", async () => {
-    const drives = await drivelist.list();
-    return drives.filter((d) => d.isUSB);
-  });
-
-  // Start USB monitoring
+  // USB detection
   usbDetect.startMonitoring();
+  usbDetect.find().then((devices) =>
+    devices.forEach((device) => mainWindow.webContents.send("usb-added", device))
+  );
+  usbDetect.on("add", (device) => mainWindow.webContents.send("usb-added", device));
+  usbDetect.on("remove", (device) => mainWindow.webContents.send("usb-removed", device));
 
-  // Already connected devices
-  usbDetect.find().then((devices) => {
-    devices.forEach((device) => mainWindow.webContents.send("usb-added", device));
-  });
-
-  usbDetect.on("add", (device) => {
-    console.log("USB added:", device);
-    mainWindow.webContents.send("usb-added", device);
-  });
-
-  usbDetect.on("remove", (device) => {
-    console.log("USB removed:", device);
-    mainWindow.webContents.send("usb-removed", device);
-  });
-
-  // ✅ Find GPS COM Port
+  // Find GPS port
   ipcMain.handle("find-gps-port", async () => {
     const ports = await SerialPort.list();
-    console.log("Available Serial Ports:", ports);
-
-    // Try to find Traxo GPS by vendorId/productId/manufacturer
-    const gps = ports.find(
-      (p) =>
-        (p.vendorId && p.vendorId.toLowerCase() === "1a86") || // Example: CH340 USB-to-Serial
-        (p.manufacturer && p.manufacturer.toLowerCase().includes("traxo"))
+    const gps = ports.find((p) =>
+      (p.vendorId && p.vendorId.toLowerCase() === "1a86") ||
+      (p.manufacturer && p.manufacturer.toLowerCase().includes("traxo"))
     );
-
-    if (!gps) {
-      return { success: false, error: "No GPS device found" };
-    }
-
-    return { success: true, path: gps.path }; // e.g. "COM5" or "/dev/ttyUSB0"
+    if (!gps) return { success: false, error: "No GPS device found" };
+    return { success: true, path: gps.path };
   });
 
-  // ✅ Start GPS reading
-  ipcMain.handle("start-gps", async (_, comPort) => {
-    try {
-      gpsPort = new SerialPort({
-        path: comPort,
-        baudRate: 9600, // Standard for GPS
-        autoOpen: true,
-      });
+  // Start GPS with custom baud rate
+ ipcMain.handle("start-gps", async (_, portPath, baudRate = 9600) => {
+  try {
+    gpsPort = new SerialPort({ path: portPath, baudRate: baudRate, autoOpen: true });
+    const parser = gpsPort.pipe(new ReadlineParser({ delimiter: "\r\n" }));
 
-      const parser = gpsPort.pipe(new ReadlineParser({ delimiter: "\r\n" }));
+    parser.on("data", (line) => {
+      console.log("📡 GPS Data:", line);   // ✅ log to main process console
+      mainWindow.webContents.send("gps-data", line); // still send to frontend
+    });
 
-      parser.on("data", (line) => {
-        console.log("📡 GPS Data:", line);
-        mainWindow.webContents.send("gps-data", line);
-      });
+    gpsPort.on("error", (err) => {
+      console.error("❌ GPS Error:", err.message); // ✅ log errors
+      mainWindow.webContents.send("gps-error", err.message);
+    });
 
-      gpsPort.on("error", (err) => {
-        console.error("❌ GPS Error:", err);
-        mainWindow.webContents.send("gps-error", err.message);
-      });
-
-      return { success: true };
-    } catch (err) {
-      return { success: false, error: err.message };
-    }
-  });
+    return { success: true };
+  } catch (err) {
+    console.error("❌ Failed to open GPS port:", err.message);
+    return { success: false, error: err.message };
+  }
+});
 }
 
 app.whenReady().then(createMainWindow);
-
 app.on("window-all-closed", () => {
   usbDetect.stopMonitoring();
+  if (gpsPort) gpsPort.close();
   if (process.platform !== "darwin") app.quit();
 });
+
 
 
 
